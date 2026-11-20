@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from io import BytesIO
 
 import pdfplumber
@@ -14,7 +14,7 @@ from urllib.request import Request, urlopen
 import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
 
-from main import find_schedule, project_dir, saved_file
+from main import DATE_QUERY_HINT, find_schedule, project_dir, saved_file
 
 
 def generate_answer(question, results, api_key):
@@ -50,6 +50,123 @@ def generate_answer(question, results, api_key):
     with urlopen(request, timeout=30) as response:
         return json.load(response)["choices"][0]["message"]["content"]
 
+def get_deepseek_key():
+    key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    if key:
+        return key
+
+    try:
+        return st.secrets.get("DEEPSEEK_API_KEY", "").strip()
+    except StreamlitSecretNotFoundError:
+        return ""
+
+
+def parse_question_with_ai(question, api_key, first_monday=None):
+    today = datetime.now(timezone(timedelta(hours=8))).date()
+    term_start = first_monday.isoformat() if first_monday else "未知"
+
+    payload = {
+        "model": "deepseek-flash",
+        "thinking": {"type": "disabled"},
+        "response_format": {"type": "json_object"},
+        "max_tokens": 300,
+        "messages": [
+            {
+                "role": "system",
+                "content": (
+                    "你负责把课表问题转换为 JSON 查询条件。"
+                    "只提取日期和用户明确提到的课程名，不回答课程内容。"
+                    "一周从周一开始，下周指下一个自然周。"
+                    "只查一天时，start_date 和 end_date 填同一天。"
+                    "没提到课程名时，course 填空字符串。"
+                    "示例 JSON："
+                    '{"start_date":"2026-11-23",'
+                    '"end_date":"2026-11-29","course":""}。'
+                    "如果日期含糊或超出能力，返回 "
+                    '{"start_date":null,"end_date":null,"course":""}。'
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"北京时间的今天：{today.isoformat()}\n"
+                    f"学期起始日：{term_start}\n"
+                    f"用户问题：{question}"
+                ),
+            },
+        ],
+    }
+
+    request = Request(
+        "https://api.deepseek.com/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    with urlopen(request, timeout=30) as response:
+        content = json.load(response)["choices"][0]["message"]["content"]
+
+    query = json.loads(content)
+    if not isinstance(query, dict):
+        return None
+
+    start = query.get("start_date")
+    end = query.get("end_date")
+
+    if not all(
+        isinstance(value, str)
+        and re.fullmatch(r"\d{4}-\d{2}-\d{2}", value)
+        for value in (start, end)
+    ):
+        return None
+
+    start_day = date.fromisoformat(start)
+    end_day = date.fromisoformat(end)
+
+    # 第一版最多查连续 31 天。
+    if not 0 <= (end_day - start_day).days <= 30:
+        return None
+
+    course = query.get("course", "")
+    return (start, end), course.strip() if isinstance(course, str) else ""
+
+
+def find_schedule_with_ai(
+    question, schedule_path, notice_path, *, use_ai=False, first_monday=None
+):
+    results = find_schedule(
+        question, schedule_path, notice_path, first_monday=first_monday
+    )
+
+    if results != [DATE_QUERY_HINT] or not use_ai:
+        return results
+
+    api_key = get_deepseek_key()
+    if not api_key:
+        return [DATE_QUERY_HINT, "AI 理解问题需要先配置 DeepSeek 密钥。"]
+
+    try:
+        with st.spinner("正在理解你的问题…"):
+            parsed = parse_question_with_ai(question, api_key, first_monday)
+    except (URLError, TimeoutError, ValueError, TypeError, KeyError, IndexError):
+        return [DATE_QUERY_HINT, "暂时无法用 AI 识别日期，可以改用具体日期查询。"]
+
+    if parsed is None:
+        return ["这句话里的日期范围还不明确。你想查哪一天，还是哪一周？"]
+
+    date_range, course_filter = parsed
+    return find_schedule(
+        question,
+        schedule_path,
+        notice_path,
+        first_monday=first_monday,
+        date_range=date_range,
+        course_filter=course_filter,
+    )
 
 st.title("课表助手")
 st.caption("演示课表，调课通知为模拟数据。试试：2026-10-24 刑法学在哪上？")
@@ -94,8 +211,11 @@ if uploaded_file is not None and uploaded_file.name.lower().endswith(".pdf"):
 with st.form("schedule_query"):
     question = st.text_input("你想查什么？")
     use_ai = st.checkbox(
-        "生成 AI 回答",
-        help="启用后，问题和命中的课表记录及调课通知会发送给 DeepSeek。",
+        "使用 AI 理解问题并生成回答",
+        help=(
+            "必要时将问题发送给 DeepSeek 识别日期。"
+            "查到课程后，将问题和命中的课表记录及调课通知发送给 DeepSeek 组织回答。"
+        ),
     )
     submitted = st.form_submit_button("查询")
 
@@ -106,10 +226,11 @@ if submitted:
         st.warning("请输入日期或星期，例如：周六有什么课？")
     else:
         if uploaded_file is None:
-            results = find_schedule(
+            results = find_schedule_with_ai(
                 question,
                 saved_file,
                 project_dir / "notices.txt",
+                use_ai=use_ai,
             )
         else:
             with TemporaryDirectory() as temp_dir:
@@ -126,10 +247,11 @@ if submitted:
                     else:
                         schedule_path.write_bytes(uploaded_file.getvalue())
 
-                    results = find_schedule(
+                    results = find_schedule_with_ai(
                         question,
                         schedule_path,
                         upload_dir / "notices.txt",
+                        use_ai=use_ai,
                         first_monday=first_monday,
                     )
                 except ValueError as error:
@@ -142,12 +264,7 @@ if submitted:
             st.text(line)
 
         if use_ai and results and re.match(r"\d{4}-\d{2}-\d{2}\s", results[0]):
-            api_key = os.getenv("DEEPSEEK_API_KEY", "")
-            if not api_key:
-                try:
-                    api_key = st.secrets.get("DEEPSEEK_API_KEY", "")
-                except StreamlitSecretNotFoundError:
-                    pass
+            api_key = get_deepseek_key()
 
             if not api_key:
                 st.info("尚未配置模型密钥。你可以查看上方的查询结果。")

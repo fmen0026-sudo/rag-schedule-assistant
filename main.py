@@ -21,8 +21,18 @@ def import_schedule():
     copyfile(source_file, saved_file)
     print("课表已导入。下次运行可以直接查询。")
 
+DATE_QUERY_HINT = "请指定日期或星期，例如 10月12号、下周一或周六。"
 
-def find_schedule(question, schedule_path, notice_path, first_monday=None):
+
+def find_schedule(
+    question,
+    schedule_path,
+    notice_path,
+    first_monday=None,
+    *,
+    date_range=None,
+    course_filter="",
+):
     """查找课程和调课通知，返回可以显示的文字列表。"""
     if not schedule_path.is_file():
         return ["请先导入课表。"]
@@ -38,7 +48,10 @@ def find_schedule(question, schedule_path, notice_path, first_monday=None):
     weekdays = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
     matched_days = [day for day in weekdays if day in question]
 
-    if date_match:
+    if date_range is not None:
+        start_date, end_date = date_range
+        target = f"{start_date} 至 {end_date}"
+    elif date_match:
         target = date_match.group()
 
     elif month_day:
@@ -69,8 +82,9 @@ def find_schedule(question, schedule_path, notice_path, first_monday=None):
     elif len(matched_days) == 1:
         target = matched_days[0]
 
+
     else:
-        return ["请指定日期或星期，例如 10月12号、下周一或周六。"]
+        return [DATE_QUERY_HINT]
 
     # 2. 从 Excel 找到符合日期或星期的课程。
     workbook = load_workbook(schedule_path, read_only=True)
@@ -81,8 +95,19 @@ def find_schedule(question, schedule_path, notice_path, first_monday=None):
         for day, time, course, classroom, date in sheet.iter_rows(
             min_row=2, max_col=5, values_only=True
         ):
-            if target == date or target == day:
-                matches.append((date, time, course, classroom))
+            date_text = str(date or "")[:10]
+
+            if date_range is not None:
+                date_matches = start_date <= date_text <= end_date
+            else:
+                date_matches = target == date_text or target == day
+
+            course_matches = (
+                    not course_filter or course_filter in str(course or "")
+            )
+
+            if date_matches and course_matches:
+                matches.append((date_text, time, course, classroom))
     finally:
         workbook.close()
 
