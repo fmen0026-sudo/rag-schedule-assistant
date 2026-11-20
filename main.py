@@ -24,6 +24,40 @@ def import_schedule():
 DATE_QUERY_HINT = "请指定日期或星期，例如 10月12号、下周一或周六。"
 
 
+def load_schedule(schedule_path, notice_path):
+    """Read course rows and attach any matching classroom-change notice."""
+    notices = notice_path.read_text(encoding="utf-8-sig").splitlines() if notice_path.is_file() else []
+    workbook = load_workbook(schedule_path, read_only=True)
+    records = []
+    try:
+        sheet = workbook["课表"]
+        for weekday, time, course, classroom, day in sheet.iter_rows(
+            min_row=2, max_col=5, values_only=True
+        ):
+            if not course:
+                continue
+            date_text = str(day or "")[:10]
+            slot = str(time or "未注明时段")
+            room = str(classroom or "未注明教室")
+            period = re.fullmatch(r"(?:第)?\s*(\d+)\s*(?:[-–—至]\s*(\d+))?\s*节", slot)
+            prefix = f"{date_text} {course}临时调至 "
+            notice = next((line for line in notices if line.startswith(prefix)), "")
+            records.append({
+                "date": date_text,
+                "weekday": str(weekday or ""),
+                "time": slot,
+                "course": str(course),
+                "classroom": notice[len(prefix):].split("，", 1)[0].strip() if notice else room,
+                "original_classroom": room if notice else "",
+                "notice": notice,
+                "first_period": int(period[1]) if period else None,
+                "last_period": int(period[2] or period[1]) if period else None,
+            })
+    finally:
+        workbook.close()
+    return records
+
+
 def find_schedule(
     question,
     schedule_path,
@@ -79,6 +113,9 @@ def find_schedule(
     elif "明天" in question:
         target = (today + timedelta(days=1)).isoformat()
 
+    elif re.search(r"第\s*[\d一二三四五六七八九十百两零〇]+\s*(?:教学)?周", question):
+        return ["按教学周查询请启用 AI，或输入具体日期。"]
+
     elif len(matched_days) == 1:
         target = matched_days[0]
 
@@ -86,58 +123,23 @@ def find_schedule(
     else:
         return [DATE_QUERY_HINT]
 
-    # 2. 从 Excel 找到符合日期或星期的课程。
-    workbook = load_workbook(schedule_path, read_only=True)
-    matches = []
-
-    try:
-        sheet = workbook["课表"]
-        for day, time, course, classroom, date in sheet.iter_rows(
-            min_row=2, max_col=5, values_only=True
-        ):
-            date_text = str(date or "")[:10]
-
-            if date_range is not None:
-                date_matches = start_date <= date_text <= end_date
-            else:
-                date_matches = target == date_text or target == day
-
-            course_matches = (
-                    not course_filter or course_filter in str(course or "")
-            )
-
-            if date_matches and course_matches:
-                matches.append((date_text, time, course, classroom))
-    finally:
-        workbook.close()
-
-    if not matches:
-        return [f"课表里没有找到 {target} 的课程。"]
-
-    # 3. 读取通知，按课程日期和课程名查找调课记录。
-    notices = []
-    if notice_path.is_file():
-        notices = notice_path.read_text(encoding="utf-8-sig").splitlines()
-
     results = []
-    for date, time, course, classroom in matches:
-        prefix = f"{date} {course}临时调至 "
-        matched_notice = next(
-            (line for line in notices if line.startswith(prefix)), None
-        )
-
-        if matched_notice:
-            new_classroom = matched_notice[len(prefix):].split("，", 1)[0].strip()
-            results.append(
-                f"{date}  {time}  {course}  "
-                f"{new_classroom}（原教室 {classroom}）"
-            )
-            results.append(f"调课依据：{matched_notice}")
-        else:
-            results.append(f"{date}  {time}  {course}  {classroom}")
-
-    # 4. 把结果交给调用方。
-    return results
+    for record in load_schedule(schedule_path, notice_path):
+        day = record["date"]
+        if date_range is not None:
+            if not start_date <= day <= end_date:
+                continue
+        elif target not in (day, record["weekday"]):
+            continue
+        if course_filter and course_filter not in record["course"]:
+            continue
+        room = record["classroom"]
+        if record["notice"]:
+            room += f"（原教室 {record['original_classroom']}）"
+        results.append(f"{day}  {record['time']}  {record['course']}  {room}")
+        if record["notice"]:
+            results.append(f"调课依据：{record['notice']}")
+    return results or [f"课表里没有找到 {target} 的课程。"]
 
 
 def query_schedule():
