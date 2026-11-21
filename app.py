@@ -247,10 +247,11 @@ render_header()
 
 with st.container(border=True, key="schedule-source"):
     st.subheader("课表来源")
-    st.caption("上传会将文件发送给 DeepSeek 云端识别。请先去除姓名和学号。")
-    uploaded_file = st.file_uploader("上传课表 PDF 或 Excel（可选）", type=["xlsx", "pdf"])
-    if uploaded_file is None:
-        st.caption("当前使用演示课表，调课通知为模拟数据。")
+    uploaded_file = st.file_uploader(
+        "上传课表 PDF 或 Excel（可选）",
+        type=["xlsx", "pdf"],
+        help="上传会将文件发送给 DeepSeek 云端识别。请先去除姓名和学号。",
+    )
     workbook, first_monday = prepare_uploaded_schedule(uploaded_file)
 
 # Associate the displayed answer with the same file and calendar used to compute it.
